@@ -7,7 +7,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import RepeatedStratifiedKFold, train_test_split
 from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import Subset
 
@@ -39,7 +39,6 @@ def _embedding_uniqueness(embeddings: np.ndarray) -> np.ndarray:
 def _signals_from_predictions(
     probs: np.ndarray,
     labels: np.ndarray,
-    embeddings: np.ndarray,
     signal_noise: np.ndarray | None = None,
 ) -> List[ExampleSignals]:
     confidences = probs.max(axis=1)
@@ -64,15 +63,14 @@ def _signals_from_predictions(
 
 
 def _assemble_signals(
-    teacher_probs_list: Sequence[np.ndarray],
-    teacher_embeddings_list: Sequence[np.ndarray],
+    avg_probs: np.ndarray,
+    avg_embeddings: np.ndarray,
+    disagreement: np.ndarray,
     labels: np.ndarray,
 ) -> List[ExampleSignals]:
-    avg_probs = np.mean(np.stack(teacher_probs_list, axis=0), axis=0)
     class_rarity = _class_rarity(labels)
-    uniqueness = _embedding_uniqueness(np.mean(np.stack(teacher_embeddings_list, axis=0), axis=0))
-    pred_variance = np.var(np.stack(teacher_probs_list, axis=0), axis=0).mean(axis=1)
-    base = _signals_from_predictions(avg_probs, labels, teacher_embeddings_list[0], signal_noise=pred_variance)
+    uniqueness = _embedding_uniqueness(avg_embeddings)
+    base = _signals_from_predictions(avg_probs, labels, signal_noise=disagreement)
     enriched = []
     for i, signal in enumerate(base):
         enriched.append(
@@ -139,13 +137,26 @@ def run_fashion_mnist_experiment(
         )
 
         skf = StratifiedKFold(n_splits=teacher_folds, shuffle=True, random_state=seed)
-        teacher_probs_list = []
-        teacher_embeddings_list = []
-        for fold, (fold_train_idx, fold_holdout_idx) in enumerate(skf.split(train_x[base_train_idx], train_y[base_train_idx])):
+        from sklearn.model_selection import RepeatedStratifiedKFold
+
+        rskf = RepeatedStratifiedKFold(
+            n_splits=teacher_folds,
+            n_repeats=2,
+            random_state=seed,
+        )
+        base_labels = train_y[base_train_idx]
+        num_examples = len(base_train_idx)
+        num_classes = int(np.max(base_labels)) + 1
+        prob_sum = np.zeros((num_examples, num_classes), dtype=np.float64)
+        prob_sq_sum = np.zeros((num_examples, num_classes), dtype=np.float64)
+        embedding_sum = None
+        counts = np.zeros(num_examples, dtype=np.int32)
+
+        for fold, (fold_train_idx, fold_holdout_idx) in enumerate(rskf.split(train_x[base_train_idx], base_labels)):
             fold_train_global = base_train_idx[fold_train_idx]
-            fold_holdout_global = base_train_idx[fold_holdout_idx]
+            fold_holdout_local = fold_holdout_idx
             fold_train_set = Subset(full_train, fold_train_global.tolist())
-            fold_val_set = Subset(full_train, fold_holdout_global.tolist())
+            fold_val_set = Subset(full_train, base_train_idx[fold_holdout_local].tolist())
             teacher = train_model(
                 fold_train_set,
                 fold_val_set,
@@ -156,14 +167,25 @@ def run_fashion_mnist_experiment(
             ).model
             probs, embeddings, labels = predict_with_embedding(
                 teacher,
-                Subset(full_train, base_train_idx.tolist()),
+                Subset(full_train, base_train_idx[fold_holdout_local].tolist()),
                 device=device,
                 batch_size=batch_size,
             )
-            teacher_probs_list.append(probs)
-            teacher_embeddings_list.append(embeddings)
+            if embedding_sum is None:
+                embedding_sum = np.zeros((num_examples, embeddings.shape[1]), dtype=np.float64)
+            prob_sum[fold_holdout_local] += probs
+            prob_sq_sum[fold_holdout_local] += probs ** 2
+            embedding_sum[fold_holdout_local] += embeddings
+            counts[fold_holdout_local] += 1
 
-        signals = _assemble_signals(teacher_probs_list, teacher_embeddings_list, train_y[base_train_idx])
+        if np.any(counts == 0):
+            raise RuntimeError("Cross-validation did not score every training example.")
+
+        avg_probs = prob_sum / counts[:, None]
+        avg_embeddings = embedding_sum / counts[:, None]
+        disagreement = (prob_sq_sum / counts[:, None] - avg_probs ** 2).mean(axis=1)
+
+        signals = _assemble_signals(avg_probs, avg_embeddings, disagreement, base_labels)
         for keep_fraction in keep_fractions:
             selected_local = keep_top_k(signals, keep_fraction=keep_fraction)
             selected_indices = base_train_idx[np.array(selected_local)]
@@ -198,4 +220,3 @@ def run_fashion_mnist_experiment(
     results = pd.DataFrame.from_records(records)
     results.to_csv(Path(output_dir) / "fashion_mnist_results.csv", index=False)
     return results
-
