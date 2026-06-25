@@ -1,0 +1,47 @@
+# Python cache and build output
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Notebook clutter
+.ipynb_checkpoints/
+
+# Generated experiment outputs
+results/*
+!results/.gitkeep
+figures/*
+!figures/.gitkeep
+
+# Downloaded datasets and large artifacts
+data/
+datasets/
+downloads/
+artifacts/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.npy
+*.h5
+*.pkl
+*.joblib
+
+# OS files
+Thumbs.db
+.DS_Store
