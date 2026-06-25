@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import RepeatedStratifiedKFold, train_test_split
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold, train_test_split
 from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import Subset
 
@@ -86,6 +86,27 @@ def _assemble_signals(
     return enriched
 
 
+def _subset_from_indices(dataset: ArrayDataset, indices: np.ndarray) -> Subset:
+    return Subset(dataset, indices.tolist())
+
+
+def _random_subset_indices(rng: np.random.Generator, population: np.ndarray, keep_fraction: float) -> np.ndarray:
+    keep_count = max(1, round(len(population) * keep_fraction))
+    return np.sort(rng.choice(population, size=keep_count, replace=False))
+
+
+def _duplicate_free_indices(images: np.ndarray, base_indices: np.ndarray) -> np.ndarray:
+    seen = set()
+    kept = []
+    for idx in base_indices:
+        digest = np.asarray(images[idx]).tobytes()
+        if digest in seen:
+            continue
+        seen.add(digest)
+        kept.append(idx)
+    return np.asarray(kept, dtype=np.int64)
+
+
 def run_fashion_mnist_experiment(
     *,
     data_dir: str | Path,
@@ -112,6 +133,7 @@ def run_fashion_mnist_experiment(
 
     for seed in seeds:
         set_seed(seed)
+        rng = np.random.default_rng(seed)
 
         full_result = train_model(
             base_train_set,
@@ -135,9 +157,6 @@ def run_fashion_mnist_experiment(
                 "notes": "baseline",
             }
         )
-
-        skf = StratifiedKFold(n_splits=teacher_folds, shuffle=True, random_state=seed)
-        from sklearn.model_selection import RepeatedStratifiedKFold
 
         rskf = RepeatedStratifiedKFold(
             n_splits=teacher_folds,
@@ -186,7 +205,18 @@ def run_fashion_mnist_experiment(
         disagreement = (prob_sq_sum / counts[:, None] - avg_probs ** 2).mean(axis=1)
 
         signals = _assemble_signals(avg_probs, avg_embeddings, disagreement, base_labels)
+
+        signal_lookup = {
+            "loss": np.asarray([s.training_loss for s in signals]),
+            "confidence": np.asarray([s.prediction_confidence for s in signals]),
+            "uniqueness": np.asarray([s.embedding_uniqueness for s in signals]),
+            "rarity": np.asarray([s.class_rarity for s in signals]),
+            "disagreement": np.asarray([s.model_disagreement for s in signals]),
+            "noise": np.asarray([s.label_noise_probability for s in signals]),
+        }
+
         for keep_fraction in keep_fractions:
+            # DataValueRank
             selected_local = keep_top_k(signals, keep_fraction=keep_fraction)
             selected_indices = base_train_idx[np.array(selected_local)]
             selected_set = Subset(full_train, selected_indices.tolist())
@@ -214,6 +244,131 @@ def run_fashion_mnist_experiment(
                     "training_time_seconds": subset_result.train_seconds,
                     "examples_removed": int(len(base_train_idx) - len(selected_indices)),
                     "notes": "cross_validated_scoring",
+                }
+            )
+
+            # Random subset
+            random_indices = _random_subset_indices(rng, base_train_idx, keep_fraction)
+            random_set = _subset_from_indices(full_train, random_indices)
+            random_result = train_model(
+                random_set,
+                val_set,
+                device=device,
+                seed=seed,
+                epochs=epochs,
+                batch_size=batch_size,
+            )
+            random_metrics = evaluate_model(
+                random_result.model,
+                make_loader(test_dataset, batch_size=batch_size, shuffle=False),
+                device=device,
+            )
+            records.append(
+                {
+                    "dataset": "Fashion-MNIST",
+                    "method": "random_subset",
+                    "seed": seed,
+                    "keep_fraction": float(len(random_indices) / len(base_train_idx)),
+                    "accuracy": random_metrics["accuracy"],
+                    "macro_f1": random_metrics["macro_f1"],
+                    "training_time_seconds": random_result.train_seconds,
+                    "examples_removed": int(len(base_train_idx) - len(random_indices)),
+                    "notes": "random_sample",
+                }
+            )
+
+            # High-loss baseline
+            loss_order = np.argsort(-signal_lookup["loss"])
+            high_loss_local = loss_order[: max(1, round(len(loss_order) * keep_fraction))]
+            high_loss_indices = base_train_idx[np.array(high_loss_local)]
+            high_loss_set = _subset_from_indices(full_train, high_loss_indices)
+            high_loss_result = train_model(
+                high_loss_set,
+                val_set,
+                device=device,
+                seed=seed,
+                epochs=epochs,
+                batch_size=batch_size,
+            )
+            high_loss_metrics = evaluate_model(
+                high_loss_result.model,
+                make_loader(test_dataset, batch_size=batch_size, shuffle=False),
+                device=device,
+            )
+            records.append(
+                {
+                    "dataset": "Fashion-MNIST",
+                    "method": "high_loss",
+                    "seed": seed,
+                    "keep_fraction": float(len(high_loss_indices) / len(base_train_idx)),
+                    "accuracy": high_loss_metrics["accuracy"],
+                    "macro_f1": high_loss_metrics["macro_f1"],
+                    "training_time_seconds": high_loss_result.train_seconds,
+                    "examples_removed": int(len(base_train_idx) - len(high_loss_indices)),
+                    "notes": "rank_by_loss_desc",
+                }
+            )
+
+            # Low-loss baseline
+            low_loss_order = np.argsort(signal_lookup["loss"])
+            low_loss_local = low_loss_order[: max(1, round(len(low_loss_order) * keep_fraction))]
+            low_loss_indices = base_train_idx[np.array(low_loss_local)]
+            low_loss_set = _subset_from_indices(full_train, low_loss_indices)
+            low_loss_result = train_model(
+                low_loss_set,
+                val_set,
+                device=device,
+                seed=seed,
+                epochs=epochs,
+                batch_size=batch_size,
+            )
+            low_loss_metrics = evaluate_model(
+                low_loss_result.model,
+                make_loader(test_dataset, batch_size=batch_size, shuffle=False),
+                device=device,
+            )
+            records.append(
+                {
+                    "dataset": "Fashion-MNIST",
+                    "method": "low_loss",
+                    "seed": seed,
+                    "keep_fraction": float(len(low_loss_indices) / len(base_train_idx)),
+                    "accuracy": low_loss_metrics["accuracy"],
+                    "macro_f1": low_loss_metrics["macro_f1"],
+                    "training_time_seconds": low_loss_result.train_seconds,
+                    "examples_removed": int(len(base_train_idx) - len(low_loss_indices)),
+                    "notes": "rank_by_loss_asc",
+                }
+            )
+
+            # Duplicate removal baseline
+            duplicate_free = _duplicate_free_indices(train_x, base_train_idx)
+            dup_keep_fraction = len(duplicate_free) / len(base_train_idx)
+            duplicate_set = _subset_from_indices(full_train, duplicate_free)
+            duplicate_result = train_model(
+                duplicate_set,
+                val_set,
+                device=device,
+                seed=seed,
+                epochs=epochs,
+                batch_size=batch_size,
+            )
+            duplicate_metrics = evaluate_model(
+                duplicate_result.model,
+                make_loader(test_dataset, batch_size=batch_size, shuffle=False),
+                device=device,
+            )
+            records.append(
+                {
+                    "dataset": "Fashion-MNIST",
+                    "method": "remove_duplicates",
+                    "seed": seed,
+                    "keep_fraction": float(dup_keep_fraction),
+                    "accuracy": duplicate_metrics["accuracy"],
+                    "macro_f1": duplicate_metrics["macro_f1"],
+                    "training_time_seconds": duplicate_result.train_seconds,
+                    "examples_removed": int(len(base_train_idx) - len(duplicate_free)),
+                    "notes": "exact_duplicate_filter",
                 }
             )
 
